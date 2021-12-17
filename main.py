@@ -5,8 +5,15 @@ import time
 import threading
 from typing import Iterator, Optional, Tuple
 
+from rich import box
+from rich.align import Align
+from rich.layout import Layout
 from rich.console import Console
+from rich.live import Live
+from rich.progress_bar import ProgressBar
 from rich.table import Table
+from rich.columns import Columns
+from river.compose import TransformerUnion
 from river.feature_extraction import Agg
 
 
@@ -17,11 +24,12 @@ def silly_stream() -> Stream:
     while True:
         yield {
             "t": (t := time.time()),
-            "cat": (cat := random.choice(["a", "b"])),
-            "x": {"a": -10, "b": 10}[cat] * (1 + math.cos(t)),
-            "y": {"a": -10, "b": 10}[cat] * (1 + math.sin(t)),
+            "c": (c := random.choice(["a", "b"])),
+            "d": (d := random.choice(["c", "d"])),
+            "x": {"a": -10, "b": 10}[c] * (1 + math.cos(t)),
+            "y": {"a": -10, "b": 10}[c] * (1 + math.sin(t)),
         }
-        time.sleep(1)
+        time.sleep(0.1)
 
 
 class Buffer(threading.Thread):
@@ -50,21 +58,26 @@ def _river_agg_to_rich_table(agg: Agg) -> Table:
     table = Table(title=agg.feature_name)
 
     for by in agg.by:
-        table.add_column("Released", justify="center", no_wrap=True)
-    table.add_column("")
+        table.add_column(by, justify="center", no_wrap=True)
+    table.add_column(agg.on)
 
-    for by, stat in agg.groups.items():
+    # The list() is here to copy the values of agg.groups, because the
+    # size might change during iteration over items, due to the data
+    # being updated in the background.
+    for by, stat in list(agg.groups.items()):
         table.add_row(*by, f"{stat.get():,.5f}")
+
+    table.box = box.SIMPLE_HEAD
 
     return table
 
 
 class ETL(threading.Thread):
-    def __init__(self, agg: Agg, stream: Stream):
+    def __init__(self, *aggs, stream: Stream):
         super().__init__()
         self.running = True
         self.stream = stream
-        self.agg = agg
+        self.agg = TransformerUnion(*aggs)
         self.n = 0
 
     def stop(self):
@@ -86,33 +99,70 @@ class ETL(threading.Thread):
             return None
 
     def run(self):
-        console = Console()
+        while self.running:
+            for record in self.stream:
+                self.agg.learn_one(record)
+                self.n += 1
 
-        with console.screen(style="bold white on black") as screen:
+
+class Display(threading.Thread):
+    def __init__(self, etl: ETL):
+        super().__init__()
+        self.running = True
+        self.etl = etl
+
+    def stop(self):
+        self.running = False
+
+    def run(self):
+        def make_tables():
+            return [
+                _river_agg_to_rich_table(agg)
+                for agg in self.etl.agg.transformers.values()
+            ]
+
+        with Live(refresh_per_second=10, screen=True, transient=True) as live:
             while self.running:
-                for record in self.stream:
-                    self.agg.learn_one(record)
-                    screen.update(_river_agg_to_rich_table(self.agg))
 
-            # for record in self.stream:
-            #     self.agg.learn_one(record)
-            #     self.n += 1
-            #     msg = ""
-            #     if (_percent_processed := self._percent_processed) :
-            #         msg += f"{_percent_processed:.2%} processed\n"
-            #     msg += str(self.agg.transform_one(record))
-            #     print(msg, end="\r")
+                layout = Layout()
+                layout.split_column(
+                    Layout(name="upper", ratio=99),
+                    Layout(name="lower", ratio=1),
+                )
+
+                if percent_processed := self.etl._percent_processed is not None:
+                    progress = ProgressBar(
+                        total=self.etl.n + len(self.etl.stream), completed=self.etl.n
+                    )
+                    layout["lower"].update(progress)
+
+                layout["upper"].update(
+                    Align(Columns(make_tables()), align="center", vertical="middle")
+                )
+                # layout = Align(layout, vertical="middle")
+                live.update(layout)
 
 
 from river import stats
 
 buffer = Buffer(silly_stream())
 buffer.start()
+time.sleep(5)
 
-etl = ETL(agg=Agg(on="x", by="cat", how=stats.Mean()), stream=buffer)
+etl = ETL(
+    Agg(on="x", by="c", how=stats.Mean()),
+    Agg(on="x", by="d", how=stats.Mean()),
+    stream=buffer,
+)
 etl.start()
-
-time.sleep(10)
+time.sleep(3)
 etl.stop()
 
+display = Display(etl)
+display.start()
+
+time.sleep(10)
+
+display.stop()
+etl.stop()
 buffer.stop()
